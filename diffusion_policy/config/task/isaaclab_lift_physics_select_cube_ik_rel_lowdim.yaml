@@ -1,0 +1,33 @@
+name: isaaclab_lift_physics_select_cube_ik_rel_lowdim
+
+obs_dim: 36
+action_dim: 7
+keypoint_dim: 0
+
+dataset_path: &dataset_path data/isaaclab/success_constant_all_datasets_20ep.hdf5
+obs_group: &obs_group teleop_obs
+action_key: &action_key actions
+obs_keys: &obs_keys [
+  ee_pose_in_robot_frame,
+  joint_pos,
+  joint_vel,
+  object_position,
+  target_object_position,
+  gripper_object_contact
+]
+
+env_runner:
+  _target_: diffusion_policy.env_runner.null_lowdim_runner.NullLowdimRunner
+
+dataset:
+  _target_: diffusion_policy.dataset.isaaclab_lowdim_dataset.IsaacLabLowdimDataset
+  dataset_path: *dataset_path
+  obs_group: *obs_group
+  action_key: *action_key
+  obs_keys: *obs_keys
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1+${n_latency_steps}'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.1
+  max_train_episodes: null

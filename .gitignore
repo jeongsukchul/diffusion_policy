@@ -25,7 +25,7 @@ __pycache__/
 
 # C extensions
 *.so
-
+IsaacLab/
 # Distribution / packaging
 .Python
 build/
