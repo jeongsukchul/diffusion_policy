@@ -83,27 +83,77 @@ parser.add_argument(
 )
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
-if args_cli.video:
+
+_require_module("dill", "pip install dill")
+_require_module("omegaconf", "pip install omegaconf")
+_require_module("hydra", "pip install hydra-core")
+
+import dill
+import gymnasium as gym
+import hydra
+import numpy as np
+import torch
+import torch.nn.functional as F
+from omegaconf import OmegaConf
+
+
+def _find_latest_checkpoint(repo_root: pathlib.Path) -> str:
+    outputs_dir = repo_root / "data" / "outputs"
+    if not outputs_dir.exists():
+        raise FileNotFoundError(f"Outputs directory not found: {outputs_dir}")
+
+    latest_candidates = list(outputs_dir.glob("**/checkpoints/latest.ckpt"))
+    if latest_candidates:
+        latest_path = max(latest_candidates, key=lambda p: p.stat().st_mtime)
+        return str(latest_path.resolve())
+
+    ckpt_candidates = list(outputs_dir.glob("**/checkpoints/*.ckpt"))
+    if ckpt_candidates:
+        latest_path = max(ckpt_candidates, key=lambda p: p.stat().st_mtime)
+        return str(latest_path.resolve())
+
+    raise FileNotFoundError(f"No checkpoints found under: {outputs_dir}")
+
+
+def _resolve_checkpoint_path(cli_checkpoint: str) -> str:
+    if cli_checkpoint is None:
+        checkpoint_path = _find_latest_checkpoint(REPO_ROOT)
+    else:
+        checkpoint_path = os.path.abspath(os.path.expanduser(cli_checkpoint))
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    return checkpoint_path
+
+
+def _peek_checkpoint_cfg(checkpoint_path: str):
+    payload = torch.load(open(checkpoint_path, "rb"), pickle_module=dill, map_location="cpu")
+    return payload["cfg"]
+
+
+def _shape_meta_obs_items(cfg) -> Dict:
+    shape_meta = getattr(cfg, "shape_meta", None)
+    if shape_meta is None:
+        shape_meta = cfg.task.shape_meta
+    return shape_meta["obs"]
+
+
+def _is_image_policy(cfg) -> bool:
+    obs_meta = _shape_meta_obs_items(cfg)
+    return any(attr.get("type", "low_dim") == "rgb" for attr in obs_meta.values())
+
+
+checkpoint_path = _resolve_checkpoint_path(args_cli.checkpoint)
+checkpoint_cfg = _peek_checkpoint_cfg(checkpoint_path)
+use_image_policy_checkpoint = _is_image_policy(checkpoint_cfg)
+if args_cli.video or use_image_policy_checkpoint:
     args_cli.enable_cameras = True
 
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 print("[play_diffusion_policy] IsaacLab app launched", flush=True)
 
-import gymnasium as gym
-import numpy as np
-import torch
-
 from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
 import isaaclab_tasks  # noqa: F401
-
-_require_module("dill", "pip install dill")
-_require_module("hydra", "pip install hydra-core")
-_require_module("omegaconf", "pip install omegaconf")
-
-import hydra
-import dill
-from omegaconf import OmegaConf
 from isaaclab.envs.mdp.observations import generated_commands, joint_pos_rel, joint_vel_rel
 from isaaclab_tasks.manager_based.manipulation.lift_physics import mdp as lift_physics_mdp
 
@@ -125,24 +175,6 @@ def _load_workspace(checkpoint_path: str, device: torch.device):
     policy.eval()
     print("[play_diffusion_policy] Policy loaded successfully", flush=True)
     return cfg, policy
-
-
-def _find_latest_checkpoint(repo_root: pathlib.Path) -> str:
-    outputs_dir = repo_root / "data" / "outputs"
-    if not outputs_dir.exists():
-        raise FileNotFoundError(f"Outputs directory not found: {outputs_dir}")
-
-    latest_candidates = list(outputs_dir.glob("**/checkpoints/latest.ckpt"))
-    if latest_candidates:
-        latest_path = max(latest_candidates, key=lambda p: p.stat().st_mtime)
-        return str(latest_path.resolve())
-
-    ckpt_candidates = list(outputs_dir.glob("**/checkpoints/*.ckpt"))
-    if ckpt_candidates:
-        latest_path = max(ckpt_candidates, key=lambda p: p.stat().st_mtime)
-        return str(latest_path.resolve())
-
-    raise FileNotFoundError(f"No checkpoints found under: {outputs_dir}")
 
 
 def _extract_policy_obs(obs_dict):
@@ -201,6 +233,105 @@ def _policy_input_from_history(history: collections.deque) -> torch.Tensor:
     return torch.stack(list(history), dim=0).unsqueeze(0)
 
 
+def _reset_dict_history(obs_dict: Dict[str, torch.Tensor], n_obs_steps: int):
+    history = {key: collections.deque(maxlen=n_obs_steps) for key in obs_dict.keys()}
+    for _ in range(n_obs_steps):
+        for key, value in obs_dict.items():
+            history[key].append(value.clone())
+    return history
+
+
+def _policy_input_from_dict_history(history: Dict[str, collections.deque]) -> Dict[str, torch.Tensor]:
+    return {key: torch.stack(list(values), dim=0).unsqueeze(0) for key, values in history.items()}
+
+
+def _append_dict_history(history: Dict[str, collections.deque], obs_dict: Dict[str, torch.Tensor]) -> None:
+    for key, value in obs_dict.items():
+        history[key].append(value.clone())
+
+
+def _prepare_image_tensor(image, expected_shape, device: torch.device) -> torch.Tensor:
+    if isinstance(image, torch.Tensor):
+        tensor = image.detach().to(device=device)
+    else:
+        tensor = torch.as_tensor(image, device=device)
+
+    if tensor.ndim == 4:
+        tensor = tensor[0]
+    if tensor.ndim != 3:
+        raise ValueError(f"Expected image with 3 dims after squeeze, got shape {tuple(tensor.shape)}")
+
+    expected_channels, expected_height, expected_width = tuple(expected_shape)
+    if tensor.shape[-1] == expected_channels and tensor.shape[0] != expected_channels:
+        tensor = tensor.permute(2, 0, 1)
+    elif tensor.shape[0] != expected_channels:
+        raise ValueError(
+            f"Could not match image channels for expected shape {tuple(expected_shape)} from input {tuple(tensor.shape)}"
+        )
+
+    tensor = tensor.to(dtype=torch.float32)
+    if tensor.max().item() > 1.0 or tensor.min().item() < 0.0:
+        tensor = tensor / 255.0
+    tensor = tensor.clamp(0.0, 1.0)
+
+    if tensor.shape[1:] != (expected_height, expected_width):
+        tensor = F.interpolate(
+            tensor.unsqueeze(0),
+            size=(expected_height, expected_width),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0)
+
+    return tensor.contiguous()
+
+
+def _extract_rgb_tensor(policy_obs: Dict, env, rgb_key: str, expected_shape, device: torch.device) -> torch.Tensor:
+    image = None
+    if rgb_key in policy_obs:
+        image = policy_obs[rgb_key]
+    elif "image" in policy_obs:
+        image = policy_obs["image"]
+    else:
+        rendered = env.render()
+        if rendered is None:
+            raise KeyError(
+                f"Missing rgb observation '{rgb_key}' in env observations and env.render() returned None."
+            )
+        image = rendered
+    return _prepare_image_tensor(image, expected_shape=expected_shape, device=device)
+
+
+def _build_policy_obs_dict(cfg, env, obs_dict, obs_keys: Iterable[str], device: torch.device) -> Dict[str, torch.Tensor]:
+    base_env = env.unwrapped
+    policy_obs = _extract_policy_obs(obs_dict)
+    obs_meta = _shape_meta_obs_items(cfg)
+    result = dict()
+
+    for key, attr in obs_meta.items():
+        obs_type = attr.get("type", "low_dim")
+        if obs_type == "rgb":
+            result[key] = _extract_rgb_tensor(
+                policy_obs=policy_obs,
+                env=env,
+                rgb_key=key,
+                expected_shape=attr["shape"],
+                device=device,
+            )
+            continue
+
+        if key in policy_obs:
+            result[key] = _to_1d_tensor(policy_obs[key], device)
+            continue
+
+        if key == "state":
+            result[key] = _build_isaaclab_lowdim_obs(base_env, obs_keys, device)
+            continue
+
+        raise KeyError(f"Missing low-dimensional observation key '{key}' for image policy input.")
+
+    return result
+
+
 def _clip_action(action: torch.Tensor, action_space) -> torch.Tensor:
     low = torch.as_tensor(action_space.low, device=action.device, dtype=action.dtype).view(1, -1)
     high = torch.as_tensor(action_space.high, device=action.device, dtype=action.dtype).view(1, -1)
@@ -210,21 +341,34 @@ def _clip_action(action: torch.Tensor, action_space) -> torch.Tensor:
 def rollout(policy, env, obs_keys: List[str], n_obs_steps: int, horizon: int, success_term, device: torch.device):
     base_env = env.unwrapped
     obs_dict, _ = env.reset()
-    policy_obs = _extract_policy_obs(obs_dict)
-    try:
-        obs_vec = _build_obs_vector(policy_obs, obs_keys, device)
-    except KeyError:
-        obs_vec = _build_isaaclab_lowdim_obs(base_env, obs_keys, device)
-    history = _reset_history(obs_vec, n_obs_steps)
+    cfg = getattr(policy, "_loaded_cfg")
+    use_image_policy = _is_image_policy(cfg)
+
+    if use_image_policy:
+        current_obs = _build_policy_obs_dict(cfg, env, obs_dict, obs_keys, device)
+        history = _reset_dict_history(current_obs, n_obs_steps)
+    else:
+        policy_obs = _extract_policy_obs(obs_dict)
+        try:
+            obs_vec = _build_obs_vector(policy_obs, obs_keys, device)
+        except KeyError:
+            obs_vec = _build_isaaclab_lowdim_obs(base_env, obs_keys, device)
+        history = _reset_history(obs_vec, n_obs_steps)
 
     episode_reward = 0.0
     steps = 0
     success = False
 
     while steps < horizon and simulation_app.is_running():
-        obs_batch = _policy_input_from_history(history)
+        if use_image_policy:
+            obs_batch = _policy_input_from_dict_history(history)
+        else:
+            obs_batch = _policy_input_from_history(history)
         with torch.no_grad():
-            action_dict = policy.predict_action({"obs": obs_batch})
+            if use_image_policy:
+                action_dict = policy.predict_action(obs_batch)
+            else:
+                action_dict = policy.predict_action({"obs": obs_batch})
         action_seq = action_dict["action"]
 
         for action_idx in range(action_seq.shape[1]):
@@ -236,12 +380,16 @@ def rollout(policy, env, obs_keys: List[str], n_obs_steps: int, horizon: int, su
             if not getattr(args_cli, "headless", False):
                 base_env.sim.render()
 
-            policy_obs = _extract_policy_obs(obs_dict)
-            try:
-                obs_vec = _build_obs_vector(policy_obs, obs_keys, device)
-            except KeyError:
-                obs_vec = _build_isaaclab_lowdim_obs(base_env, obs_keys, device)
-            history.append(obs_vec)
+            if use_image_policy:
+                current_obs = _build_policy_obs_dict(cfg, env, obs_dict, obs_keys, device)
+                _append_dict_history(history, current_obs)
+            else:
+                policy_obs = _extract_policy_obs(obs_dict)
+                try:
+                    obs_vec = _build_obs_vector(policy_obs, obs_keys, device)
+                except KeyError:
+                    obs_vec = _build_isaaclab_lowdim_obs(base_env, obs_keys, device)
+                history.append(obs_vec)
 
             if success_term is not None and bool(success_term.func(base_env, **success_term.params)[0]):
                 success = True
@@ -259,13 +407,6 @@ def rollout(policy, env, obs_keys: List[str], n_obs_steps: int, horizon: int, su
 def main():
     if args_cli.num_envs != 1:
         raise ValueError("This standalone runner currently supports only --num_envs 1.")
-
-    if args_cli.checkpoint is None:
-        checkpoint_path = _find_latest_checkpoint(REPO_ROOT)
-    else:
-        checkpoint_path = os.path.abspath(os.path.expanduser(args_cli.checkpoint))
-    if not os.path.exists(checkpoint_path):
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
     print(f"[play_diffusion_policy] Using checkpoint: {checkpoint_path}", flush=True)
 
     policy_device_str = args_cli.policy_device if args_cli.policy_device is not None else args_cli.device
@@ -275,6 +416,7 @@ def main():
     random.seed(args_cli.seed)
 
     cfg, policy = _load_workspace(checkpoint_path, device=device)
+    policy._loaded_cfg = cfg
     obs_keys = list(cfg.task.dataset.obs_keys)
     n_obs_steps = int(cfg.n_obs_steps)
     print(f"[play_diffusion_policy] Obs keys: {obs_keys}", flush=True)
@@ -290,7 +432,8 @@ def main():
     success_term = getattr(env_cfg.terminations, "success", None)
     if success_term is not None:
         env_cfg.terminations.success = None
-    env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+    render_mode = "rgb_array" if (args_cli.video or use_image_policy_checkpoint) else None
+    env = gym.make(args_cli.task, cfg=env_cfg, render_mode=render_mode)
     print("[play_diffusion_policy] IsaacLab env created", flush=True)
     if args_cli.video:
         video_dir = os.path.abspath(os.path.expanduser(args_cli.video_dir))

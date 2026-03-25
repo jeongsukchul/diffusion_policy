@@ -34,4 +34,5 @@ python custom_isaaclab_dp/play_diffusion_policy.py \
 
 - The script reads `n_obs_steps`, observation keys, and model config directly from the checkpoint.
 - It uses the EMA policy if the checkpoint contains one.
-- It is built for the low-dimensional IsaacLab dataset/config added in this repo, not the hybrid image policy path.
+- It now supports both low-dimensional and image-based IsaacLab diffusion-policy checkpoints.
+- For image checkpoints, it auto-enables cameras before IsaacLab launch and requests `rgb_array` rendering when needed.
